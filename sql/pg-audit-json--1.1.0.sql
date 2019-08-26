@@ -142,7 +142,8 @@ CREATE TABLE audit.log (
     action TEXT NOT NULL CHECK (action IN ('I','D','U', 'T')),
     row_data JSONB,
     changed_fields JSONB,
-    statement_only BOOLEAN NOT NULL
+    statement_only BOOLEAN NOT NULL,
+    is_notification_sent BOOLEAN
 );
 
 REVOKE ALL ON audit.log FROM public;
@@ -189,12 +190,16 @@ COMMENT ON COLUMN audit.log.changed_fields
   IS 'New values of fields for INSERT or changed by UPDATE. Null for DELETE';
 COMMENT ON COLUMN audit.log.statement_only
   IS '''t'' if audit event is from an FOR EACH STATEMENT trigger, ''f'' for FOR EACH ROW';
+COMMENT ON COLUMN audit.log.is_notification_sent
+  IS '''t'' if the admins have been notified of the audit event, ''null'' is the default';
 
 CREATE INDEX log_relid_idx ON audit.log(relid);
 CREATE INDEX log_action_tstamp_tx_stm_idx ON audit.log(action_tstamp_stm);
 CREATE INDEX log_action_idx ON audit.log(action);
 CREATE INDEX log_table_name_schema_name_row_key_action_tstamp_tx_idx
     ON audit.log (table_name, schema_name, row_key, action_tstamp_tx DESC);
+CREATE INDEX log_table_name_schema_name_is_notification_sent_action_tstamp_tx_idx
+    ON audit.log (table_name, schema_name, is_notification_sent, action_tstamp_tx DESC);
 
 --
 -- Allow the user of the extension to create a backup of the audit log data
@@ -238,8 +243,9 @@ BEGIN
     substring(TG_OP, 1, 1),                         -- action
     NULL,                                           -- row_data
     NULL,                                           -- changed_fields
-    'f'                                             -- statement_only
-    );
+    'f',                                            -- statement_only
+    NULL                                            -- is_notification_sent
+  );
 
   IF NOT TG_ARGV[0]::BOOLEAN IS DISTINCT FROM 'f'::BOOLEAN THEN
     audit_row.client_query = NULL;
