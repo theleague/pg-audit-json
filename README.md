@@ -14,7 +14,7 @@ Significant changes made from original work:
 * Slight table/column name differences
 * INSERT values are stored in the `changed_fields` instead of `row_data` to
   indicate that a new record is an entire change.
-
+* row_key has been added for a key back to the row in the audited table
 
 ## Audit Table Reference
 
@@ -30,6 +30,7 @@ Column | Type | Not&nbsp;Null | Description
 `action_tstamp_stm` | `TIMESTAMP` | &#x2611; | Statement start timestamp for tx in which audited event occurred
 `action_tstamp_clk` | `TIMESTAMP` | &#x2611; | Wall clock time at which audited event's trigger call occurred
 `transaction_id` | `BIGINT` | &#x2611; | Identifier of transaction that made the change. <br />Unique when paired with `action_tstamp_tx.`
+`row_key` | `TEXT` | &#x2611; | Key for the row in the audited table, by default, this is the value from the ''id'' column converted to text.
 `client_addr` | `INET` | | IP address of client that issued query. Null for unix domain socket.
 `client_port` | `INTEGER` | | Port address of client that issued query. <br />Undefined for unix socket.
 `client_query` | `TEXT` | | Top-level query that caused this auditable event. <br />May be more than one.
@@ -86,6 +87,28 @@ SELECT audit.audit_table('myschema.mytable');
 
 -- Ignore columns "foo" and "bar"
 SELECT audit.audit_table('mytable', true, true, '{foo,bar}');
+```
+
+### Additional Options
+
+To use a different source column for row_key
+
+```sql
+SELECT audit.audit_table('target_table_name', 'row_key_column_name');
+```
+
+Arguments for full version of audit_table function:
+
+* target_table:     Table name, schema qualified if not on search_path
+* audit_rows:       Record each row change, or only audit at a statement level
+* audit_query_text: Record the text of the client query that triggered the audit event?
+* ignored_cols:     Columns to exclude from update diffs, ignore updates that change only ignored cols.
+* row_key_col:      Column used to identify a row in the target_table.
+
+an example using all of these
+
+```sql
+SELECT audit.audit_table('target_table_name', 'true', 'false', '{version_col, changed_by, changed_timestamp}'::text[], 'row_key_column_name');
 ```
 
 ### Setting application runtime variables
