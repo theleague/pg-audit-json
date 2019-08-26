@@ -381,7 +381,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION audit.audit_table(REGCLASS, BOOLEAN, BOOLEAN, TEXT[], TEXT[]) IS $$
+COMMENT ON FUNCTION audit.audit_table(REGCLASS, BOOLEAN, BOOLEAN, TEXT[], TEXT) IS $$
 Add auditing support to a table.
 
 Arguments:
@@ -415,9 +415,9 @@ $$;
 --
 CREATE OR REPLACE FUNCTION audit.audit_table(target_table REGCLASS)
 RETURNS VOID
-LANGUAGE 'sql'
+LANGUAGE SQL
 AS $$
-  SELECT audit.audit_table($1, BOOLEAN 't', BOOLEAN 't', NULL);
+  SELECT audit.audit_table($1, BOOLEAN 't', BOOLEAN 't', ARRAY[]::TEXT[], NULL);
 $$;
 
 
@@ -426,8 +426,8 @@ $$;
 -- but with a row_key_col specified.
 --
 CREATE OR REPLACE FUNCTION audit.audit_table(
-  target_table regclass,
-  row_key_col text)
+  target_table REGCLASS,
+  row_key_col TEXT)
 RETURNS VOID
 LANGUAGE SQL
 AS $$
