@@ -15,6 +15,12 @@
 --
 -- Note: This method will be a supported operation of PostgreSQL 10
 --
+--
+-- This implementation also incorporates the row_key approach as found in:
+--   https://github.com/tekells-usgs/pg-json-audit-trigger/commit/8dc02122fa3b35dfca00834833a0bc6208374f11
+--   https://github.com/westrac/pg-audit-json/commit/0d04969301468c28141839e10b26f301727e58a1
+--
+
 -- Credit:
 -- http://schinckel.net/2014/09/29/adding-json%28b%29-operators-to-postgresql/
 --
@@ -127,6 +133,7 @@ CREATE TABLE audit.log (
     action_tstamp_stm TIMESTAMP WITH TIME ZONE NOT NULL,
     action_tstamp_clk TIMESTAMP WITH TIME ZONE NOT NULL,
     transaction_id BIGINT NOT NULL,
+    row_key TEXT,
     application_name TEXT,
     application_user_name TEXT,
     client_addr INET,
@@ -162,6 +169,8 @@ COMMENT ON COLUMN audit.log.action_tstamp_clk
   IS 'Wall clock time at which audited event''s trigger call occurred';
 COMMENT ON COLUMN audit.log.transaction_id
   IS 'Identifier of transaction that made the change. Unique when paired with action_tstamp_tx.';
+COMMENT ON COLUMN audit.log.row_key
+  IS 'Key for the row in the audited table, by default, this is the value from the ''id'' column converted to text';
 COMMENT ON COLUMN audit.log.client_addr
   IS 'IP address of client that issued query. Null for unix domain socket.';
 COMMENT ON COLUMN audit.log.client_port
@@ -184,6 +193,8 @@ COMMENT ON COLUMN audit.log.statement_only
 CREATE INDEX log_relid_idx ON audit.log(relid);
 CREATE INDEX log_action_tstamp_tx_stm_idx ON audit.log(action_tstamp_stm);
 CREATE INDEX log_action_idx ON audit.log(action);
+CREATE INDEX log_table_name_schema_name_row_key_action_tstamp_tx_idx
+    ON audit.log (table_name, schema_name, row_key, action_tstamp_tx DESC);
 
 --
 -- Allow the user of the extension to create a backup of the audit log data
@@ -198,11 +209,10 @@ SET search_path = pg_catalog, public
 AS $$
 DECLARE
     audit_row audit.log;
-    include_values BOOLEAN;
-    log_diffs BOOLEAN;
-    h_old JSONB;
-    h_new JSONB;
     excluded_cols TEXT[] = ARRAY[]::TEXT[];
+    row_key_col TEXT = 'id';
+    jsonb_old JSONB;
+    jsonb_new JSONB;
 BEGIN
   IF TG_WHEN <> 'AFTER' THEN
     RAISE EXCEPTION 'audit.if_modified_func() may only run as an AFTER trigger';
@@ -219,6 +229,7 @@ BEGIN
     statement_timestamp(),                          -- action_tstamp_stm
     clock_timestamp(),                              -- action_tstamp_clk
     txid_current(),                                 -- transaction ID
+    NULL,                                           -- the 'id' column from the NEW row (if it exists)
     current_setting('audit.application_name', true),      -- client application
     current_setting('audit.application_user_name', true), -- client user name
     inet_client_addr(),                             -- client_addr
@@ -238,21 +249,42 @@ BEGIN
     excluded_cols = TG_ARGV[1]::TEXT[];
   END IF;
 
+  IF TG_ARGV[2] IS NOT NULL THEN
+    row_key_col = TG_ARGV[2]::TEXT;
+  END IF;
+
   IF (TG_OP = 'INSERT' AND TG_LEVEL = 'ROW') THEN
-    audit_row.changed_fields = to_jsonb(NEW.*) - excluded_cols;
+    jsonb_new = to_jsonb(NEW.*);
+    IF jsonb_new ? row_key_col THEN
+      audit_row.row_key = jsonb_new ->> row_key_col;
+    END IF;
+    audit_row.changed_fields = jsonb_new - excluded_cols;
+
   ELSIF (TG_OP = 'UPDATE' AND TG_LEVEL = 'ROW') THEN
-    audit_row.row_data = to_jsonb(OLD.*) - excluded_cols;
-    audit_row.changed_fields =
-      (to_jsonb(NEW.*) - audit_row.row_data) - excluded_cols;
-    IF audit_row.changed_fields = '{}'::JSONB THEN
+    jsonb_new = to_jsonb(NEW.*);
+    jsonb_old = to_jsonb(OLD.*);
+    IF jsonb_new ? row_key_col THEN
+      audit_row.row_key = jsonb_new ->> row_key_col;
+    END IF;
+    audit_row.row_data = jsonb_old - excluded_cols;
+    audit_row.changed_fields = (jsonb_new - audit_row.row_data) - excluded_cols;
+    IF audit_row.changed_fields = '{}'::jsonb THEN
       -- All changed fields are ignored. Skip this update.
       RETURN NULL;
     END IF;
+
   ELSIF (TG_OP = 'DELETE' AND TG_LEVEL = 'ROW') THEN
-    audit_row.row_data = to_jsonb(OLD.*) - excluded_cols;
+    jsonb_old = to_jsonb(OLD.*);
+    IF jsonb_old ? row_key_col THEN
+        audit_row.row_key = jsonb_old ->> row_key_col;
+    END IF;
+    audit_row.row_data = jsonb_old - excluded_cols;
+    
+
   ELSIF (TG_LEVEL = 'STATEMENT' AND
-         TG_OP IN ('INSERT','UPDATE','DELETE','TRUNCATE')) THEN
+        TG_OP IN ('INSERT','UPDATE','DELETE','TRUNCATE')) THEN
     audit_row.statement_only = 't';
+
   ELSE
     RAISE EXCEPTION '[audit.if_modified_func] - Trigger func added as trigger '
                     'for unhandled case: %, %', TG_OP, TG_LEVEL;
@@ -286,6 +318,9 @@ param 1: TEXT[], columns to ignore in updates. Default [].
          that do not exist in the target table. This lets you specify
          a standard set of ignored columns.
 
+param 2: text, row_key_col, the column name for the row identifier in
+         the target table
+
 There is no parameter to disable logging of values. Add this trigger as
 a 'FOR EACH STATEMENT' rather than 'FOR EACH ROW' trigger if you do not
 want to log row values.
@@ -302,7 +337,8 @@ CREATE OR REPLACE FUNCTION audit.audit_table(
   target_table REGCLASS,
   audit_rows BOOLEAN,
   audit_query_text BOOLEAN,
-  ignored_cols TEXT[]
+  ignored_cols TEXT[],
+  row_key_col TEXT
 )
 RETURNS VOID
 LANGUAGE 'plpgsql'
@@ -311,13 +347,17 @@ DECLARE
   stm_targets TEXT = 'INSERT OR UPDATE OR DELETE OR TRUNCATE';
   _q_txt TEXT;
   _ignored_cols_snip TEXT = '';
+  _row_key_col_snip TEXT = '';
 BEGIN
   EXECUTE 'DROP TRIGGER IF EXISTS audit_trigger_row ON ' || target_table::TEXT;
   EXECUTE 'DROP TRIGGER IF EXISTS audit_trigger_stm ON ' || target_table::TEXT;
 
   IF audit_rows THEN
-    IF array_length(ignored_cols,1) > 0 THEN
+    IF (array_length(ignored_cols,1) > 0 OR row_key_col IS NOT NULL) THEN
         _ignored_cols_snip = ', ' || quote_literal(ignored_cols);
+    END IF;
+    IF row_key_col IS NOT NULL THEN
+        _row_key_col_snip = ', ' || quote_literal(row_key_col);
     END IF;
     _q_txt = 'CREATE TRIGGER audit_trigger_row '
              'AFTER INSERT OR UPDATE OR DELETE ON ' ||
@@ -325,6 +365,7 @@ BEGIN
              ' FOR EACH ROW EXECUTE PROCEDURE audit.if_modified_func(' ||
              quote_literal(audit_query_text) ||
              _ignored_cols_snip ||
+             _row_key_col_snip || 
              ');';
     RAISE NOTICE '%', _q_txt;
     EXECUTE _q_txt;
@@ -340,7 +381,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION audit.audit_table(REGCLASS, BOOLEAN, BOOLEAN, TEXT[]) IS $$
+COMMENT ON FUNCTION audit.audit_table(REGCLASS, BOOLEAN, BOOLEAN, TEXT[], TEXT[]) IS $$
 Add auditing support to a table.
 
 Arguments:
@@ -350,6 +391,7 @@ Arguments:
                      the audit event?
    ignored_cols:     Columns to exclude from update diffs,
                      ignore updates that change only ignored cols.
+   row_key_col:      Column used to identify a row in the target_table.
 $$;
 
 --
@@ -363,19 +405,35 @@ CREATE OR REPLACE FUNCTION audit.audit_table(
 RETURNS VOID
 LANGUAGE SQL
 AS $$
-  SELECT audit.audit_table($1, $2, $3, ARRAY[]::TEXT[]);
+  SELECT audit.audit_table($1, $2, $3, ARRAY[]::TEXT[], NULL);
 $$;
 
 --
 -- And provide a convenience call wrapper for the simplest case
--- of row-level logging with no excluded cols and query logging enabled.
+-- of row-level logging with no excluded cols and query logging enabled,
+-- and no row key specified.
 --
 CREATE OR REPLACE FUNCTION audit.audit_table(target_table REGCLASS)
 RETURNS VOID
 LANGUAGE 'sql'
 AS $$
-  SELECT audit.audit_table($1, BOOLEAN 't', BOOLEAN 't');
+  SELECT audit.audit_table($1, BOOLEAN 't', BOOLEAN 't', NULL);
 $$;
+
+
+--
+-- And provide a convenience call wrapper for case like the simplest,
+-- but with a row_key_col specified.
+--
+CREATE OR REPLACE FUNCTION audit.audit_table(
+  target_table regclass,
+  row_key_col text)
+RETURNS VOID
+LANGUAGE SQL
+AS $$
+  SELECT audit.audit_table($1, BOOLEAN 't', BOOLEAN 't', ARRAY[]::TEXT[], $2);
+$$;
+
 
 COMMENT ON FUNCTION audit.audit_table(REGCLASS) IS $$
 Add auditing support to the given table. Row-level changes will be logged with
